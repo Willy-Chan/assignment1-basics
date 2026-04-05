@@ -613,59 +613,103 @@ def run_train_bpe(
                 Merges are ordered by order of creation.
     """
 
+    # The BPE Algorithm (naive):
+    #   get mapping {word : frequency}
+    #   for num_merges times:
+    #       for every word:
+    #           for every pair in that word:
+    #               pair_counts[pair] += word's frequency
+    #   
+    #       most_frequent_pair = find_most_frequent_pair(pair_counts)
+    #       
+    #       update vocab to include this new word + tokenID
+    #       
+    #       update word_counts() -> for every word, if the word contains our most frequent pair, build the new byte-sequence and add to word_counts
+
+
+
     # vocab == 256 bytes + special tokens
-    vocab = {i: bytes([i]) for i in range(256)}
+    vocab = {i: bytes([i]) for i in range(256)}          # you have your normal bytes...
     for i in range(len(special_tokens)):
         special_token = special_tokens[i]
-        vocab[256+i] = special_token.encode("utf-8")     # byte-wise encoding of the special character: SEQUENCE of bytes!
+        vocab[256+i] = special_token.encode("utf-8")     # then each special token is represented as a SEQUENCE of bytes, not just bytes 0-255.
     
 
     # pretokenizer & special token patterns
     SPECIAL_SPLIT_PATTERN = re.compile("|".join(re.escape(t) for t in special_tokens))
 
-    # read corpus, split on special tokens
-    word_counts = Counter()
-    ## SERIAL:
+    # read corpus and split on special tokens
+    word_counts = Counter[Any]()        # { byte_sequence : frequency }
+    ############################
+    # SERIAL IMPLEMENTATION
     # with open(input_path, "rb") as f:
-    #     content = f.read().decode("utf-8")
-    # fragments = re.split(SPECIAL_SPLIT_PATTERN, content)
-    # # tokenization: map each word to a tuple of bytes and count it all up
-    # for frag in fragments:
-    #     for tok in re.findall(PAT, frag):
-    #         byte_tuple = tuple(tok.encode("utf-8"))
-    #         if byte_tuple not in word_counts:
-    #             word_counts[byte_tuple] = 0
-    #         word_counts[byte_tuple] += 1
-
-    ## PARALLEL:
+    #     content = f.read().decode("utf-8")                                    # open and read the file in UTF-8 bytes
+    # fragments = re.split(SPECIAL_SPLIT_PATTERN, content)                      # .split() on special tokens
+    # for frag in fragments:                                                    # for every fragment...
+    #     for tok in re.findall(PAT, frag):                                         # for every token we regex out...
+    #         byte_tuple = tuple(tok.encode("utf-8"))                                   # convert token -> UTF-8 byte sequence
+    #         word_counts[byte_tuple] += 1                                              # word_counts[byte sequence]++
+    ############################
+    ############################
+    # PARALLEL IMPLEMENTATION
     num_processes = 4
     with open(input_path, "rb") as f:
-        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
-    tasks = [(input_path, start, end, SPECIAL_SPLIT_PATTERN) for start, end in zip(boundaries[:-1], boundaries[1:])]
+        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")                                                           # split text file into 4 chunks
+    tasks = [(input_path, start, end, SPECIAL_SPLIT_PATTERN) for start, end in zip(boundaries[:-1], boundaries[1:])]    # define start, end for the 4 chunks
     with Pool(processes=num_processes) as pool:
-        results = pool.map(count_pretokens_in_chunks, tasks)
-
+        results = pool.map(count_pretokens_in_chunks, tasks)                                                                             # use pool.map to give each chunk to an independent process
     for local_map in results:
-        word_counts.update(local_map)
+        word_counts.update(local_map)                                                                                                    # each process produces a local_map counter, which we can then use with .update() to update the global counter (word_counts)
+    ############################
 
-    # word_counts NOW HAS FREQUENCY OF ALL TOKENS: {tok1 : 265534, tok2: 2390, .......}
-    # BPE algorithm:
-    #   find most common pair of bytes
-    #   make that a new token ID
-    #   replace every instance of that pair in ALL words with the new token ID
-    #   update cache so the next iteration knows what the NEW most common pair is
-    
-    # Merging logic
+    # at this point in the code, word_counts is a frequency map of all the byte-sequences
+    # word_counts == {byte_sequence (word) : freq}
+
+    # Now we implement the merging logic:
     merges = []
     num_merges = vocab_size - (256 + len(special_tokens))   # merge until we reach max vocab size
 
-    # have cache of pair counts
-    # pair_counts = [(pair1, pair2) : freq]
-    pair_counts = Counter()
-    
-    # IMPORTANT OPTIMIZATION: maintain mapping of (pair) -> [all words containing this pair]. This speeds up part (3): updating the counts with the new word
-    # pair_counts = [(pair1, pair2) : [list_of_words_containing_this_pair]]
-    pair_to_words = defaultdict(set)
+    ############################
+    # SERIAL IMPLEMENTATION
+    # for i in range(num_merges):
+    #     for byte_tuple, freq in word_counts.items():
+    #         for pair in zip(byte_tuple, byte_tuple[1:]):                                  # for every word: for every pair: update pair_counts
+    #             if pair not in pair_counts:
+    #                 pair_counts[pair] = 0
+    #             pair_counts[pair] += freq
+
+    #     most_frequent_pair = max(pair_counts.keys(), 
+    #        key=lambda pair: (pair_counts[pair], vocab[pair[0]], vocab[pair[1]]))          # find the most frequent pair and mint a new token ID
+    #     new_token_id = 256 + len(special_tokens) + i
+
+    #     merges.append((vocab[most_frequent_pair[0]], vocab[most_frequent_pair[1]]))
+    #     vocab[new_token_id] = vocab[most_frequent_pair[0]] + vocab[most_frequent_pair[1]]         # update vocab to include this new token
+
+    #     # update word_counts with newly merged tokens
+    #     new_word_counts = {}
+    #     # for every word, merge the relevant 2 bytes in those tuples                                              # for word, check if it has this pair
+    #     for byte_tuple, freq in word_counts.items():
+    #         new_word = []
+    #         idx = 0
+    #         while idx < len(byte_tuple):
+    #             if idx < len(byte_tuple) - 1 and (byte_tuple[idx], byte_tuple[idx+1]) == most_frequent_pair:      # if so, construct a new byte sequence w/ this new byte
+    #                 new_word.append(new_token_id)
+    #                 idx += 2
+    #             else:
+    #                 new_word.append(byte_tuple[idx])                                                              # if not, copy over the byte like normal
+    #                 idx += 1 
+    #         if tuple(new_word) not in new_word_counts:
+    #             new_word_counts[tuple(new_word)] = 0
+    #         new_word_counts[tuple(new_word)] += freq                                                               # we've construted a new_token! Add this to the counts
+    #     word_counts = new_word_counts 
+    ############################
+    ############################
+    # PARALLEL IMPLEMENTATION
+    pair_counts = Counter()                     # pair_counts = [(pair1, pair2) : freq]
+    pair_to_words = defaultdict(set)       # pair_to_words = [(pair1, pair2) : [list_of_words_containing_this_pair]]
+
+    # IMPORTANT OPTIMIZATION: maintain mapping of (pair) -> [all words containing this pair]. 
+    # This avoids us having to iterate over ALL words and checking if they contain the most frequent pair: we just lookup from this dict all the relevant words containing this pair
 
     for word, freq in word_counts.items():
         for i in range(len(word) - 1):
@@ -673,35 +717,33 @@ def run_train_bpe(
             pair_counts[pair] += freq
             pair_to_words[pair].add(word)
 
-
-
-    # iterate a bunch of times...
+    # Repeat merging a bunch of times...
     for i in range(num_merges):
         if not pair_counts:
             break
         
-        # Find the most frequent pair and merge them into a new token
-        # BREAK TIES using LEXICOGRAPHIC ORDER: we first max by count, then max by the first byte_tuple of pair,  then max by the second byte_tuple of pair 
+        # Find the most frequent pair
         most_frequent_pair = max(pair_counts.keys(), key=lambda pair: (pair_counts[pair], vocab[pair[0]], vocab[pair[1]]))      # (tok_id_1, tok_id_2)
         new_token_id = 256 + len(special_tokens) + i
+
+        # record the merge
         merges.append((vocab[most_frequent_pair[0]], vocab[most_frequent_pair[1]]))
+
+        # update the vocab to have the new token ID & byte-sequence
         vocab[new_token_id] = vocab[most_frequent_pair[0]] + vocab[most_frequent_pair[1]]
 
-        # we now have a new token (new_token_id) with byte sequence vocab[new_token_id].
-
-        # get only words containing this specific pair
+        # OPTIMIZATION: get only words containing this specific pair
         words_to_process = list(pair_to_words[most_frequent_pair])
 
-        del pair_counts[most_frequent_pair]     # remove this MFP from our caches
+        # remove the old most-frequent-pair from our cache - this pair is going to be its own word now!
+        del pair_counts[most_frequent_pair]
         del pair_to_words[most_frequent_pair]
 
-
-        # for word, freq in word_counts.items():
-        for word in words_to_process:           # iterate over words_to_process instead of over all words!!!
+        # NOTE: we're iterating over words_to_process, which is a lot smaller than the global word_counts!
+        for word in words_to_process:
             # We much (1) remove pair frequencies of this word from the cache, (2) build the new word, (3) add the new word/pairs back to the cache
-            
             freq = word_counts[word]
-            del word_counts[word]       # remove word from overall count
+            del word_counts[word]       # (0) remove word from overall count
 
             # (1) remove pair frequencies of this word
             for i in range(len(word) - 1):
@@ -732,7 +774,7 @@ def run_train_bpe(
                 pair_to_words[pair].add(new_word_tuple)
             
             word_counts[new_word_tuple] += freq # add count of new word back to word_counts
-        
+        ############################
 
     return vocab, merges
 
