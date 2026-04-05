@@ -24,7 +24,7 @@ class Tokenizer:
         self.bytes_to_id = {value: key for key, value in vocab.items()}  # bytes to token ID
 
         if self.special_tokens:
-            self.special_pattern = re.compile("(" + "|".join(re.escape(t) for t in self.special_tokens) + ")")
+            self.special_pattern = re.compile("(" + "|".join(re.escape(t) for t in self.special_tokens) + ")")  # capture, not eliminate
         else:
             self.special_pattern = None
 
