@@ -4,6 +4,7 @@ import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
+from networkx.algorithms.assortativity import pairs
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
@@ -562,6 +563,27 @@ def get_tokenizer(
     raise NotImplementedError
 
 
+import regex as re
+from multiprocessing import Pool
+from collections import Counter
+PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+
+def count_pretokens_in_chunks(args):
+    path, start, end, special_pattern = args
+    word_counts = Counter()
+    with open(path, "rb") as f:
+        f.seek(start)
+        chunk_content = f.read(end - start).decode("utf-8", errors="replace")
+    fragments = re.split(special_pattern, chunk_content)
+    # tokenization: map each word to a tuple of bytes and count it all up
+    for frag in fragments:
+        for tok in re.findall(PAT, frag):
+            byte_tuple = tuple(tok.encode("utf-8"))
+            word_counts[byte_tuple] += 1
+    return word_counts
+
+
+
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -589,4 +611,137 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+
+    # vocab == 256 bytes + special tokens
+    vocab = {i: bytes([i]) for i in range(256)}
+    for i in range(len(special_tokens)):
+        special_token = special_tokens[i]
+        vocab[256+i] = special_token.encode("utf-8")     # byte-wise encoding of the special character: SEQUENCE of bytes!
+    
+
+    # pretokenizer & special token patterns
+    SPECIAL_SPLIT_PATTERN = re.compile("|".join(re.escape(t) for t in special_tokens))
+
+    # read corpus, split on special tokens
+    word_counts = Counter()
+    ## SERIAL:
+    # with open(input_path, "rb") as f:
+    #     content = f.read().decode("utf-8")
+    # fragments = re.split(SPECIAL_SPLIT_PATTERN, content)
+    # # tokenization: map each word to a tuple of bytes and count it all up
+    # for frag in fragments:
+    #     for tok in re.findall(PAT, frag):
+    #         byte_tuple = tuple(tok.encode("utf-8"))
+    #         if byte_tuple not in word_counts:
+    #             word_counts[byte_tuple] = 0
+    #         word_counts[byte_tuple] += 1
+
+    ## PARALLEL:
+    num_processes = 4
+    with open(input_path, "rb") as f:
+        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+    tasks = [(input_path, start, end, SPECIAL_SPLIT_PATTERN) for start, end in zip(boundaries[:-1], boundaries[1:])]
+    with Pool(processes=num_processes) as pool:
+        results = pool.map(count_pretokens_in_chunks, tasks)
+
+    for local_map in results:
+        word_counts.update(local_map)
+
+    # word_counts NOW HAS FREQUENCY OF ALL TOKENS: {tok1 : 265534, tok2: 2390, .......}
+    
+    # Merging logic
+    merges = []
+    num_merges = vocab_size - (256 + len(special_tokens))   # merge until we reach max vocab size
+
+    # iterate a bunch of times...
+    for i in range(num_merges):
+        # find freqency of ALL pairs in ALL words
+        pair_counts = {}
+        for byte_tuple, freq in word_counts.items():
+            for pair in zip(byte_tuple, byte_tuple[1:]):
+                if pair not in pair_counts:
+                    pair_counts[pair] = 0
+                pair_counts[pair] += freq
+    
+        if not pair_counts:
+            break
+        
+        # Find the most frequent pair and merge them
+        # BREAK TIES using LEXICOGRAPHIC ORDER: we first max by count, then max by the first byte_tuple of pair,  then max by the second byte_tuple of pair 
+        most_frequent_pair = max(pair_counts.keys(), key=lambda pair: (pair_counts[pair], vocab[pair[0]], vocab[pair[1]]))      # (tok_id_1, tok_id_2)
+        new_token_id = 256 + len(special_tokens) + i
+
+        merges.append((vocab[most_frequent_pair[0]], vocab[most_frequent_pair[1]]))
+        vocab[new_token_id] = vocab[most_frequent_pair[0]] + vocab[most_frequent_pair[1]]
+
+        # update word_counts with newly merged tokens
+        new_word_counts = {}
+        # for every word, merge the relevant 2 bytes in those tuples
+        for byte_tuple, freq in word_counts.items():
+            new_word = []
+            idx = 0
+            while idx < len(byte_tuple):
+                if idx < len(byte_tuple) - 1 and (byte_tuple[idx], byte_tuple[idx+1]) == most_frequent_pair:
+                    new_word.append(new_token_id)
+                    idx += 2
+                else:
+                    new_word.append(byte_tuple[idx])
+                    idx += 1 
+            if tuple(new_word) not in new_word_counts:
+                new_word_counts[tuple(new_word)] = 0
+            new_word_counts[tuple(new_word)] += freq
+        
+        word_counts = new_word_counts
+
+    
+
+    return vocab, merges
+
+
+def find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+
+    # Get total file size in bytes
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    # Initial guesses for chunk boundary locations, uniformly spaced
+    # Chunks start on previous index, don't include last index
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)  # Start at boundary guess
+        while True:
+            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            # Find the special token in the mini chunk
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+    return sorted(set(chunk_boundaries))
+
+
