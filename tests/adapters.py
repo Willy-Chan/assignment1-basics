@@ -4,6 +4,7 @@ import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
+from mpmath import j0
 from networkx.algorithms.assortativity import pairs
 import numpy.typing as npt
 import torch
@@ -565,7 +566,7 @@ def get_tokenizer(
 
 import regex as re
 from multiprocessing import Pool
-from collections import Counter
+from collections import Counter, defaultdict
 PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
 def count_pretokens_in_chunks(args):
@@ -648,52 +649,90 @@ def run_train_bpe(
         word_counts.update(local_map)
 
     # word_counts NOW HAS FREQUENCY OF ALL TOKENS: {tok1 : 265534, tok2: 2390, .......}
+    # BPE algorithm:
+    #   find most common pair of bytes
+    #   make that a new token ID
+    #   replace every instance of that pair in ALL words with the new token ID
+    #   update cache so the next iteration knows what the NEW most common pair is
     
     # Merging logic
     merges = []
     num_merges = vocab_size - (256 + len(special_tokens))   # merge until we reach max vocab size
 
+    # have cache of pair counts
+    # pair_counts = [(pair1, pair2) : freq]
+    pair_counts = Counter()
+    
+    # IMPORTANT OPTIMIZATION: maintain mapping of (pair) -> [all words containing this pair]. This speeds up part (3): updating the counts with the new word
+    # pair_counts = [(pair1, pair2) : [list_of_words_containing_this_pair]]
+    pair_to_words = defaultdict(set)
+
+    for word, freq in word_counts.items():
+        for i in range(len(word) - 1):
+            pair = (word[i], word[i+1])
+            pair_counts[pair] += freq
+            pair_to_words[pair].add(word)
+
+
+
     # iterate a bunch of times...
     for i in range(num_merges):
-        # find freqency of ALL pairs in ALL words
-        pair_counts = {}
-        for byte_tuple, freq in word_counts.items():
-            for pair in zip(byte_tuple, byte_tuple[1:]):
-                if pair not in pair_counts:
-                    pair_counts[pair] = 0
-                pair_counts[pair] += freq
-    
         if not pair_counts:
             break
         
-        # Find the most frequent pair and merge them
+        # Find the most frequent pair and merge them into a new token
         # BREAK TIES using LEXICOGRAPHIC ORDER: we first max by count, then max by the first byte_tuple of pair,  then max by the second byte_tuple of pair 
         most_frequent_pair = max(pair_counts.keys(), key=lambda pair: (pair_counts[pair], vocab[pair[0]], vocab[pair[1]]))      # (tok_id_1, tok_id_2)
         new_token_id = 256 + len(special_tokens) + i
-
         merges.append((vocab[most_frequent_pair[0]], vocab[most_frequent_pair[1]]))
         vocab[new_token_id] = vocab[most_frequent_pair[0]] + vocab[most_frequent_pair[1]]
 
-        # update word_counts with newly merged tokens
-        new_word_counts = {}
-        # for every word, merge the relevant 2 bytes in those tuples
-        for byte_tuple, freq in word_counts.items():
-            new_word = []
-            idx = 0
-            while idx < len(byte_tuple):
-                if idx < len(byte_tuple) - 1 and (byte_tuple[idx], byte_tuple[idx+1]) == most_frequent_pair:
-                    new_word.append(new_token_id)
-                    idx += 2
-                else:
-                    new_word.append(byte_tuple[idx])
-                    idx += 1 
-            if tuple(new_word) not in new_word_counts:
-                new_word_counts[tuple(new_word)] = 0
-            new_word_counts[tuple(new_word)] += freq
-        
-        word_counts = new_word_counts
+        # we now have a new token (new_token_id) with byte sequence vocab[new_token_id].
 
-    
+        # get only words containing this specific pair
+        words_to_process = list(pair_to_words[most_frequent_pair])
+
+        del pair_counts[most_frequent_pair]     # remove this MFP from our caches
+        del pair_to_words[most_frequent_pair]
+
+
+        # for word, freq in word_counts.items():
+        for word in words_to_process:           # iterate over words_to_process instead of over all words!!!
+            # We much (1) remove pair frequencies of this word from the cache, (2) build the new word, (3) add the new word/pairs back to the cache
+            
+            freq = word_counts[word]
+            del word_counts[word]       # remove word from overall count
+
+            # (1) remove pair frequencies of this word
+            for i in range(len(word) - 1):
+                pair = (word[i], word[i+1])
+                if pair != most_frequent_pair:
+                    pair_counts[pair] -= freq
+                    if pair_counts[pair] <= 0:
+                        del pair_counts[pair]
+                    pair_to_words[pair].discard(word)
+
+            # (2) build new word
+            new_word = []
+            j = 0
+            while j < len(word):
+                # iterate through the word: either add existing char, or add the new token ID
+                if j < len(word) - 1 and word[j] == most_frequent_pair[0] and word[j+1] == most_frequent_pair[1]:
+                    new_word.append(new_token_id)
+                    j += 2  # merged w next byte
+                else:
+                    new_word.append(word[j])
+                    j += 1
+            new_word_tuple = tuple(new_word)
+
+            # (3) add all new pairs back to the cache. Basically look at all pairs in this NEW WORD we've just constructed, and add the frequencies back to our cache
+            for j in range(len(new_word_tuple) - 1):
+                pair = (new_word_tuple[j], new_word_tuple[j + 1])
+                pair_counts[pair] += freq
+                pair_to_words[pair].add(new_word_tuple)
+            
+            word_counts[new_word_tuple] += freq # add count of new word back to word_counts
+        
 
     return vocab, merges
 
