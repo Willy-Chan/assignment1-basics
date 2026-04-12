@@ -115,3 +115,4 @@ class Tokenizer:
         res = b"".join(list_of_byteseqs).decode("utf-8", errors="replace")
 
         return res
+
